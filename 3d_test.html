@@ -1,0 +1,494 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Great Acceleration Room</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wght@400;600;800&family=JetBrains+Mono:wght@400;600&display=swap">
+<style>
+  :root {
+    color-scheme: dark;
+    --night: #0c1219;
+    --panel: rgba(16, 24, 33, 0.86);
+    --line: #2a3a4a;
+    --ink: #e8eef3;
+    --muted: #93a4b3;
+    --pop: #8ec5e8;
+    --co2: #f2b45a;
+    --energy: #b89df2;
+    --go: #f2b45a;
+  }
+  html, body { height: 100%; margin: 0; }
+  body {
+    background: var(--night);
+    color: var(--ink);
+    font-family: "Archivo", system-ui, sans-serif;
+    overflow: hidden;
+  }
+  #stage { position: fixed; inset: 0; }
+  #stage canvas { display: block; width: 100%; height: 100%; touch-action: none; }
+  .hud {
+    position: fixed;
+    left: 16px; bottom: calc(16px + env(safe-area-inset-bottom, 0px));
+    width: min(400px, calc(100% - 32px));
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    padding: 18px 20px;
+    display: grid; gap: 12px;
+    backdrop-filter: blur(6px);
+  }
+  h1 { margin: 0; font-weight: 800; font-size: 22px; letter-spacing: -0.01em; text-wrap: balance; }
+  p { margin: 0; color: var(--muted); line-height: 1.5; font-size: 14px; }
+  .legend { display: flex; flex-wrap: wrap; gap: 6px 14px; font-size: 13px; }
+  .legend span { display: inline-flex; align-items: center; gap: 6px; }
+  .legend i { width: 10px; height: 10px; border-radius: 2px; display: inline-block; }
+  .ref { display: flex; align-items: center; gap: 10px; font-size: 13px; color: var(--muted); }
+  select {
+    font: 600 13px "JetBrains Mono", ui-monospace, monospace; color: var(--ink);
+    background: #16212c; border: 1px solid var(--line); border-radius: 6px; padding: 6px 8px;
+  }
+  select:focus-visible { outline: 2px solid var(--go); outline-offset: 1px; }
+  .buttons { display: flex; flex-wrap: wrap; gap: 8px; }
+  button {
+    font: 600 14px "Archivo", system-ui, sans-serif;
+    padding: 10px 16px; border-radius: 6px; cursor: pointer;
+    border: 1px solid var(--go); background: var(--go); color: #1a1206;
+  }
+  button.ghost { background: transparent; color: var(--go); }
+  button:disabled { opacity: 0.4; cursor: not-allowed; }
+  button:focus-visible { outline: 2px solid var(--ink); outline-offset: 2px; }
+  .readout, .status {
+    font-family: "JetBrains Mono", ui-monospace, monospace;
+    font-size: 12px; line-height: 1.5; font-variant-numeric: tabular-nums;
+  }
+  .readout { color: var(--ink); min-height: 1.5em; }
+  .status { color: var(--muted); }
+</style>
+</head>
+<body>
+
+<div id="stage"></div>
+
+<section class="hud" aria-label="Controls">
+  <h1>The Great Acceleration, walk-in</h1>
+  <p>Three indicators from 1900 to 2020. Every bar is scaled to the reference year, which stands at 100%. Click any bar to make its year the reference. Drag to orbit, hover to read. On a Quest, point with a controller or pinch.</p>
+  <label class="ref" for="refyear">Reference year
+    <select id="refyear"></select>
+  </label>
+  <div class="legend" id="legend"></div>
+  <div class="buttons">
+    <button id="vr" disabled>Enter VR</button>
+    <button id="ar" class="ghost" disabled>Enter mixed reality</button>
+  </div>
+  <div class="readout" id="readout">Hover or point at a bar</div>
+  <div class="status" id="status">Checking for WebXR…</div>
+</section>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script>
+(async () => {
+  // Approximate values (rounded). Sources: UN / HYDE population; Law Dome + Mauna Loa CO₂; Smil / Our World in Data primary energy.
+  const YEARS = [1900, 1950, 1960, 1970, 1980, 1990, 2000, 2010, 2020];
+  const SERIES = [
+    { name: "World population", unit: "billion", color: 0x8ec5e8, css: "#8ec5e8",
+      values: [1.6, 2.5, 3.0, 3.7, 4.4, 5.3, 6.1, 6.9, 7.8] },
+    { name: "CO₂ above pre-industrial", unit: "ppm over 280", color: 0xf2b45a, css: "#f2b45a",
+      values: [16, 31, 37, 46, 59, 74, 89, 109, 134] },
+    { name: "Primary energy use", unit: "thousand TWh/yr", color: 0xb89df2, css: "#b89df2",
+      values: [12, 28.5, 41, 61, 83, 101, 118, 148, 165] },
+  ];
+  let refIdx = 0;                      // index into YEARS of the 100% reference
+  let metersPerX = 0.18;               // height of 1× the reference, adapts so the tallest bar stays ~2.5 m
+  function computeScale() {
+    const maxRatio = Math.max(...SERIES.map((s) => Math.max(...s.values) / s.values[refIdx]));
+    metersPerX = Math.min(1.2, 2.5 / maxRatio);
+    return maxRatio;
+  }
+  computeScale();
+  const reduceMotion = matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+  try { await document.fonts.ready; } catch (e) {}
+
+  // ---------- renderer / scene ----------
+  const stage = document.getElementById("stage");
+  const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+  renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+  renderer.setSize(innerWidth, innerHeight);
+  renderer.xr.enabled = true;
+  stage.appendChild(renderer.domElement);
+
+  const scene = new THREE.Scene();
+  const NIGHT = new THREE.Color(0x0c1219);
+  scene.background = NIGHT;
+  scene.fog = new THREE.Fog(0x0c1219, 6, 16);
+
+  const camera = new THREE.PerspectiveCamera(60, innerWidth / innerHeight, 0.05, 50);
+  const target = new THREE.Vector3(0, 1.0, -2.4);
+  let yaw = innerWidth > 800 ? -0.28 : 0, pitch = 0.18, dist = 3.8;
+  function placeCamera() {
+    camera.position.set(
+      target.x + dist * Math.sin(yaw) * Math.cos(pitch),
+      target.y + dist * Math.sin(pitch),
+      target.z + dist * Math.cos(yaw) * Math.cos(pitch));
+    camera.lookAt(target);
+  }
+  placeCamera();
+
+  scene.add(new THREE.HemisphereLight(0xcfe3f5, 0x1a2230, 0.7));
+  const sun = new THREE.DirectionalLight(0xffffff, 0.8);
+  sun.position.set(2, 5, 2);
+  scene.add(sun);
+
+  // Floor
+  const floor = new THREE.Group();
+  const disc = new THREE.Mesh(new THREE.CircleGeometry(7, 64),
+    new THREE.MeshStandardMaterial({ color: 0x0e151d, roughness: 1 }));
+  disc.rotation.x = -Math.PI / 2;
+  floor.add(disc);
+  const grid = new THREE.GridHelper(14, 28, 0x2a3a4a, 0x1b2733);
+  grid.position.y = 0.001;
+  floor.add(grid);
+  scene.add(floor);
+
+  // ---------- text on canvas ----------
+  function textPlane(lines, { w = 1, px = 40, color = "#e8eef3", align = "center", bg = null, weight = 600, mono = false, minWidth = 0 } = {}) {
+    const c = document.createElement("canvas");
+    const ctx = c.getContext("2d");
+    const family = mono ? '"JetBrains Mono", monospace' : '"Archivo", sans-serif';
+    const lh = px * 1.3;
+    c.width = 1024;
+    let maxW = 0;
+    lines.forEach((l) => {
+      const t = typeof l === "string" ? { text: l } : l;
+      ctx.font = `${t.weight || weight} ${t.px || px}px ${t.mono ?? mono ? '"JetBrains Mono", monospace' : '"Archivo", sans-serif'}`;
+      maxW = Math.max(maxW, ctx.measureText(t.text).width);
+    });
+    if (!bg) c.width = Math.min(2048, Math.max(minWidth, Math.ceil(maxW + 72)));
+    c.height = Math.ceil(lh * lines.length + px * 0.6);
+    function draw(ls, col) {
+      ctx.clearRect(0, 0, c.width, c.height);
+      if (bg) { ctx.fillStyle = bg; ctx.fillRect(0, 0, c.width, c.height); }
+      ls.forEach((l, i) => {
+        const t = typeof l === "string" ? { text: l } : l;
+        ctx.font = `${t.weight || weight} ${t.px || px}px ${t.mono ?? mono ? '"JetBrains Mono", monospace' : '"Archivo", sans-serif'}`;
+        ctx.fillStyle = t.color || col;
+        ctx.textAlign = align;
+        ctx.textBaseline = "top";
+        const x = align === "center" ? c.width / 2 : 36;
+        ctx.fillText(t.text, x, px * 0.3 + i * lh);
+      });
+    }
+    draw(lines, color);
+    const tex = new THREE.CanvasTexture(c);
+    tex.anisotropy = 4;
+    const mesh = new THREE.Mesh(new THREE.PlaneGeometry(w * c.width / 1024, w * c.height / 1024),
+      new THREE.MeshBasicMaterial({ map: tex, transparent: true, depthWrite: false }));
+    mesh.userData.redraw = (ls) => { draw(ls, color); tex.needsUpdate = true; };
+    return mesh;
+  }
+
+  // ---------- bars ----------
+  const chart = new THREE.Group();
+  scene.add(chart);
+  const bars = [];
+  const barGeo = new THREE.BoxGeometry(0.28, 1, 0.28).translate(0, 0.5, 0);
+  const rowZ = [-1.6, -2.4, -3.2];           // shortest row in front
+  const x0 = -1.8, dx = 0.45;
+
+  SERIES.forEach((s, si) => {
+    const base = s.values[refIdx];
+    s.values.forEach((v, yi) => {
+      const mat = new THREE.MeshStandardMaterial({ color: s.color, roughness: 0.55, metalness: 0.05, emissive: 0x000000 });
+      const bar = new THREE.Mesh(barGeo, mat);
+      const h = (v / base) * metersPerX;
+      bar.position.set(x0 + yi * dx, 0, rowZ[si]);
+      bar.scale.y = reduceMotion ? h : 0.001;
+      bar.userData = { series: s, yi, year: YEARS[yi], value: v, h, delay: yi * 0.06 + si * 0.15 };
+      chart.add(bar);
+      bars.push(bar);
+    });
+    const label = textPlane([{ text: s.name, color: s.css }], { w: 1.2, px: 64 });
+    label.position.set(x0 - 0.75, 0.12, rowZ[si]);
+    label.rotation.y = 0.35;
+    chart.add(label);
+  });
+
+  // Year labels on the floor in front of the first row
+  const yearLabels = YEARS.map((y, i) => {
+    const t = textPlane([String(y)], { w: 0.7, px: 90, color: "#93a4b3", mono: true, weight: 800 });
+    t.rotation.x = -Math.PI / 2;
+    t.position.set(x0 + i * dx, 0.005, rowZ[0] + 0.35);
+    chart.add(t);
+    return t;
+  });
+
+  // Floor strip marking the reference column
+  const strip = new THREE.Mesh(new THREE.PlaneGeometry(0.4, rowZ[0] - rowZ[2] + 0.9),
+    new THREE.MeshBasicMaterial({ color: 0xf2b45a, transparent: true, opacity: 0.18, depthWrite: false }));
+  strip.rotation.x = -Math.PI / 2;
+  strip.position.set(x0, 0.003, (rowZ[0] + rowZ[2]) / 2 + 0.1);
+  chart.add(strip);
+
+  // Scale lines at the back, rebuilt whenever the reference changes
+  const ticks = new THREE.Group();
+  chart.add(ticks);
+  const tickTargets = [];
+  function buildTicks(maxRatio) {
+    ticks.children.slice().forEach((o) => {
+      ticks.remove(o);
+      o.geometry.dispose();
+      if (o.material.map) o.material.map.dispose();
+      o.material.dispose();
+    });
+    let ms = [0.25, 0.5, 1, 2, 5, 10, 20].filter((m) => m <= maxRatio * 1.001 && m * metersPerX >= 0.2);
+    if (!ms.includes(1)) ms.push(1);
+    ms.sort((a, b) => a - b);
+    if (ms.length > 3) ms = [1, ...ms.filter((m) => m > 1).slice(-2)];
+    ms.forEach((m) => {
+      const y = m * metersPerX;
+      const strong = m === 1;
+      const line = new THREE.Mesh(new THREE.BoxGeometry(4.1, strong ? 0.012 : 0.006, 0.006),
+        new THREE.MeshBasicMaterial({ color: strong ? 0xf2b45a : 0x3b4d5f }));
+      line.position.set(0, y, rowZ[2] - 0.25);
+      ticks.add(line);
+      const label = m === 1 ? `100% = ${YEARS[refIdx]}` : `${m >= 1 ? m + "×" : Math.round(m * 100) + "%"}`;
+      const t = textPlane([label], { w: 0.9, px: 70, color: strong ? "#f2b45a" : "#93a4b3", mono: true });
+      t.position.set(2.2 + t.geometry.parameters.width / 2, y, rowZ[2] - 0.25);
+      ticks.add(t);
+    });
+  }
+
+  const title = textPlane([
+    { text: "The Great Acceleration", px: 64, weight: 800 },
+    { text: "each bar relative to its 1900 value · click a bar to rebase", px: 40, color: "#93a4b3", weight: 400 },
+  ], { w: 2.4, minWidth: 1500 });
+  title.position.set(0, 2.95, rowZ[2] - 0.3);
+  chart.add(title);
+
+  // Info panel (visible in VR)
+  const panel = textPlane([
+    { text: "Point at a bar", px: 56, weight: 800 },
+    { text: "trigger or pinch to select", px: 38, color: "#93a4b3", weight: 400 },
+    " ", " ",
+  ], { w: 1.1, align: "left", bg: "rgba(16,24,33,0.9)" });
+  panel.position.set(-2.55, 1.45, -1.6);
+  panel.rotation.y = 0.6;
+  chart.add(panel);
+
+  function describe(bar) {
+    const d = bar.userData;
+    return {
+      head: `${d.series.name}, ${d.year}`,
+      value: `${d.value} ${d.series.unit}`,
+      ratio: `${Math.round((d.value / d.series.values[refIdx]) * 100)}% of ${YEARS[refIdx]}`,
+    };
+  }
+  const readout = document.getElementById("readout");
+  const legend = document.getElementById("legend");
+  const refSelect = document.getElementById("refyear");
+  refSelect.innerHTML = YEARS.map((y, i) => `<option value="${i}">${y}</option>`).join("");
+  refSelect.addEventListener("change", () => setRef(+refSelect.value));
+
+  function setRef(i) {
+    refIdx = i;
+    const maxRatio = computeScale();
+    for (const b of bars) b.userData.h = (b.userData.value / b.userData.series.values[refIdx]) * metersPerX;
+    buildTicks(maxRatio);
+    strip.userData.x = x0 + refIdx * dx;
+    yearLabels.forEach((t, k) => t.userData.redraw([
+      { text: String(YEARS[k]), color: k === refIdx ? "#f2b45a" : "#93a4b3" }]));
+    title.userData.redraw([
+      { text: "The Great Acceleration", px: 64, weight: 800 },
+      { text: `each bar relative to its ${YEARS[refIdx]} value · click a bar to rebase`, px: 40, color: "#93a4b3", weight: 400 },
+    ]);
+    refSelect.value = String(refIdx);
+    const last = YEARS.length - 1;
+    const short = ["Population", "CO₂ above 280 ppm", "Primary energy"];
+    legend.innerHTML = SERIES.map((s, k) => {
+      const r = s.values[last] / s.values[refIdx];
+      const txt = refIdx === last ? "100%" : `${r.toFixed(1)}× by 2020`;
+      return `<span><i style="background:${s.css}"></i>${short[k]} ${txt}</span>`;
+    }).join("");
+    if (mouseHover) show(mouseHover);
+  }
+  function show(bar) {
+    if (!bar) return;
+    const t = describe(bar);
+    readout.innerHTML = `<span style="color:${bar.userData.series.css}">■</span> ${t.head} · ${t.value} · ${t.ratio}`;
+    panel.userData.redraw([
+      { text: String(bar.userData.year), px: 56, weight: 800, color: bar.userData.series.css },
+      { text: bar.userData.series.name, px: 40 },
+      { text: t.value, px: 38, mono: true, weight: 400 },
+      { text: t.ratio, px: 38, mono: true, weight: 400, color: "#93a4b3" },
+    ]);
+  }
+
+  // ---------- picking ----------
+  const raycaster = new THREE.Raycaster();
+  const hovered = new Set();
+  function pick(origin, dir) {
+    raycaster.set(origin, dir);
+    const hit = raycaster.intersectObjects(bars, false)[0];
+    return hit ? hit : null;
+  }
+  function setGlow(bar, on) {
+    bar.material.emissive.setHex(on ? 0x333333 : 0x000000);
+  }
+
+  // Desktop mouse
+  const mouse = new THREE.Vector2();
+  let dragging = false, lastX = 0, lastY = 0, moved = 0;
+  let mouseHover = null;
+  function setMouse(e) {
+    mouse.x = (e.clientX / innerWidth) * 2 - 1;
+    mouse.y = -(e.clientY / innerHeight) * 2 + 1;
+  }
+  renderer.domElement.addEventListener("pointerdown", (e) => {
+    dragging = true; moved = 0; lastX = e.clientX; lastY = e.clientY;
+    setMouse(e);
+    renderer.domElement.setPointerCapture(e.pointerId);
+  });
+  renderer.domElement.addEventListener("pointerup", (e) => {
+    dragging = false;
+    if (moved > 6 || renderer.xr.isPresenting) return;
+    setMouse(e);
+    raycaster.setFromCamera(mouse, camera);
+    const hit = raycaster.intersectObjects(bars, false)[0];
+    if (hit) { mouseHover = hit.object; setRef(hit.object.userData.yi); show(hit.object); }
+  });
+  renderer.domElement.addEventListener("pointermove", (e) => {
+    mouse.x = (e.clientX / innerWidth) * 2 - 1;
+    mouse.y = -(e.clientY / innerHeight) * 2 + 1;
+    if (dragging) {
+      const ddx = e.clientX - lastX, ddy = e.clientY - lastY;
+      moved += Math.abs(ddx) + Math.abs(ddy);
+      yaw -= ddx * 0.006;
+      pitch = Math.min(1.2, Math.max(-0.1, pitch + ddy * 0.004));
+      lastX = e.clientX; lastY = e.clientY;
+      placeCamera();
+    }
+  });
+  renderer.domElement.addEventListener("wheel", (e) => {
+    e.preventDefault();
+    dist = Math.min(8, Math.max(1.5, dist * (1 + e.deltaY * 0.001)));
+    placeCamera();
+  }, { passive: false });
+
+  // XR controllers (also driven by hand-tracking pinch on Quest)
+  const controllers = [0, 1].map((i) => {
+    const c = renderer.xr.getController(i);
+    const ray = new THREE.Line(
+      new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(0, 0, 0), new THREE.Vector3(0, 0, -1)]),
+      new THREE.LineBasicMaterial({ color: 0xf2b45a }));
+    ray.scale.z = 5;
+    c.add(ray);
+    c.userData.ray = ray;
+    c.addEventListener("selectstart", () => {
+      const b = c.userData.hit;
+      if (b) { setRef(b.userData.yi); show(b); }
+    });
+    scene.add(c);
+    return c;
+  });
+  const tmpMat = new THREE.Matrix4();
+  const origin = new THREE.Vector3(), dir = new THREE.Vector3();
+
+  // ---------- XR session buttons ----------
+  const vrBtn = document.getElementById("vr");
+  const arBtn = document.getElementById("ar");
+  const status = document.getElementById("status");
+  let session = null;
+
+  async function supported(mode) {
+    try { return !!(navigator.xr && await navigator.xr.isSessionSupported(mode)); }
+    catch (e) { return false; }
+  }
+  const [hasVR, hasAR] = await Promise.all([supported("immersive-vr"), supported("immersive-ar")]);
+  vrBtn.disabled = !hasVR;
+  arBtn.disabled = !hasAR;
+  if (hasVR || hasAR) status.textContent = "WebXR ready. Put on the headset and press a button.";
+  else if (!navigator.xr) status.textContent = "No WebXR in this browser. Open the page in the Meta Quest Browser to go immersive.";
+  else status.textContent = "WebXR is present but not permitted here (the page may be inside a frame). Open it directly over HTTPS on the Quest.";
+
+  async function enter(mode) {
+    if (session) { session.end(); return; }
+    try {
+      session = await navigator.xr.requestSession(mode, { optionalFeatures: ["local-floor", "hand-tracking"] });
+    } catch (e) {
+      status.textContent = `Could not start ${mode}: ${e.message}`;
+      return;
+    }
+    const ar = mode === "immersive-ar";
+    scene.background = ar ? null : NIGHT;
+    scene.fog.far = ar ? 1000 : 16;
+    floor.visible = !ar;
+    // In a real room, bring the chart closer and make it table-sized
+    chart.scale.setScalar(ar ? 0.5 : 1);
+    chart.position.set(0, 0, ar ? 0.8 : 0);
+    renderer.xr.setReferenceSpaceType("local-floor");
+    await renderer.xr.setSession(session);
+    (ar ? arBtn : vrBtn).textContent = "Exit";
+    session.addEventListener("end", () => {
+      session = null;
+      vrBtn.textContent = "Enter VR";
+      arBtn.textContent = "Enter mixed reality";
+      scene.background = NIGHT; scene.fog.far = 16; floor.visible = true;
+      chart.scale.setScalar(1); chart.position.set(0, 0, 0);
+      placeCamera();
+    });
+  }
+  vrBtn.addEventListener("click", () => enter("immersive-vr"));
+  arBtn.addEventListener("click", () => enter("immersive-ar"));
+
+  setRef(0);
+
+  // ---------- loop ----------
+  const clock = new THREE.Clock();
+  renderer.setAnimationLoop(() => {
+    const dt = Math.min(0.1, clock.getDelta());
+    const t = clock.elapsedTime;
+    const k = reduceMotion ? 1 : Math.min(1, dt * 7);
+    for (const b of bars) {
+      if (!reduceMotion && t < b.userData.delay) continue;   // staggered rise on load
+      b.scale.y = Math.max(0.001, b.scale.y + (b.userData.h - b.scale.y) * k);
+    }
+    strip.position.x += (strip.userData.x - strip.position.x) * k;
+
+    const now = new Set();
+    if (renderer.xr.isPresenting) {
+      for (const c of controllers) {
+        tmpMat.identity().extractRotation(c.matrixWorld);
+        origin.setFromMatrixPosition(c.matrixWorld);
+        dir.set(0, 0, -1).applyMatrix4(tmpMat);
+        const hit = pick(origin, dir);
+        c.userData.hit = hit ? hit.object : null;
+        c.userData.ray.scale.z = hit ? hit.distance : 5;
+        if (hit) now.add(hit.object);
+      }
+    } else {
+      raycaster.setFromCamera(mouse, camera);
+      const hit = raycaster.intersectObjects(bars, false)[0];
+      const b = hit ? hit.object : null;
+      if (b && b !== mouseHover && !dragging) show(b);
+      mouseHover = b;
+      if (b) now.add(b);
+      renderer.domElement.style.cursor = b ? "pointer" : "grab";
+    }
+    hovered.forEach((b) => { if (!now.has(b)) setGlow(b, false); });
+    now.forEach((b) => setGlow(b, true));
+    hovered.clear(); now.forEach((b) => hovered.add(b));
+
+    renderer.render(scene, camera);
+  });
+
+  addEventListener("resize", () => {
+    camera.aspect = innerWidth / innerHeight;
+    camera.updateProjectionMatrix();
+    renderer.setSize(innerWidth, innerHeight);
+  });
+})();
+</script>
+</body>
+</html>
